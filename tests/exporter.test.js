@@ -4,6 +4,7 @@ jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
   mkdtempSync: jest.fn(),
   readFileSync: jest.fn(),
+  writeFileSync: jest.fn(),
   existsSync: jest.fn(),
 }));
 
@@ -94,6 +95,16 @@ describe('exportDiff', () => {
     expect(refactorings[0].type).toBe('Rename Method');
     expect(refactorings[0].markup).toContain('[a()](');
     expect(refactorings[0].markup).toContain('in class `C`');
+  });
+
+  test('writes the companion-extension feed into the web view', async () => {
+    await exportDiff('pull_request', '/event.json', 'img', 'tok');
+    const [feedPath, contents] = fs.writeFileSync.mock.calls[0];
+    expect(feedPath).toBe(`${FAKE_TMP}/web/refactorings.json`);
+    const feed = JSON.parse(contents);
+    expect(feed.commits).toHaveLength(1);
+    expect(feed.commits[0].url).toBe('https://github.com/o/r/pull/7/changes');
+    expect(feed.commits[0].refactorings[0].type).toBe('Rename Method');
   });
 
   test('throws when the export did not produce a web view', async () => {

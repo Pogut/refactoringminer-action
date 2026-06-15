@@ -8,6 +8,11 @@ const DEFAULT_IMAGE = 'tsantalis/refactoringminer:latest';
 const CONTAINER_EXPORT = '/diff/exported';
 const RM_JAR = '/opt/refactoringminer/lib/RefactoringMiner-DockerBuild.jar';
 
+// Companion-extension feed, published next to the web view. The browser
+// extension fetches this and renders the overlays itself, reusing this single
+// RefactoringMiner run instead of recomputing anything client-side.
+const FEED_FILE = 'refactorings.json';
+
 /**
  * Builds the GitHub URL that RefactoringMiner's `diff --url` mode analyzes.
  * Prefers the PR's html_url from the event payload; otherwise constructs a
@@ -64,15 +69,20 @@ async function exportDiff(eventName, eventPath, image = DEFAULT_IMAGE, token = '
     throw new Error(`Expected exported web view at ${webDir} was not produced`);
   }
 
-  return { webDir, refactorings: readRefactorings(tmpDir) };
+  const exported = readExport(tmpDir);
+  writeFeed(webDir, url, exported);
+
+  return { webDir, refactorings: exported.refactorings };
 }
 
 /**
  * Reads the `jsons/refactorings.json` that `diff --export` writes next to the
- * web view, and returns its `refactorings` array. Throws if the file is absent,
- * which signals the image predates the JSON/markup export and must be updated.
+ * web view. Each refactoring carries `markup` (GitHub-linked, used by the PR
+ * comment) plus `leftSideLocations`/`rightSideLocations` (the `CodeRange`s the
+ * extension overlays). Throws if the file is absent, which signals the image
+ * predates the JSON/markup export and must be updated.
  */
-function readRefactorings(tmpDir) {
+function readExport(tmpDir) {
   const jsonPath = path.join(tmpDir, 'jsons', 'refactorings.json');
   if (!fs.existsSync(jsonPath)) {
     throw new Error(
@@ -82,7 +92,22 @@ function readRefactorings(tmpDir) {
   }
 
   const parsed = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-  return Array.isArray(parsed.refactorings) ? parsed.refactorings : [];
+  return {
+    url: typeof parsed.url === 'string' ? parsed.url : '',
+    refactorings: Array.isArray(parsed.refactorings) ? parsed.refactorings : [],
+  };
 }
 
-module.exports = { exportDiff, buildAnalysisUrl, readRefactorings };
+/**
+ * Writes the companion-extension feed into the web view so publisher's
+ * `cpSync(webDir, …)` carries it to `refactorings/pr-<n>/refactorings.json`
+ * (Pages) or into the artifact. Shape mirrors RefactoringMiner's classic
+ * `-json` output — `{ commits: [ { url, refactorings:[…] } ] }` — which is what
+ * the extension's overlay engine already expects.
+ */
+function writeFeed(webDir, analysisUrl, exported) {
+  const feed = { commits: [{ url: exported.url || analysisUrl, refactorings: exported.refactorings }] };
+  fs.writeFileSync(path.join(webDir, FEED_FILE), JSON.stringify(feed));
+}
+
+module.exports = { exportDiff, buildAnalysisUrl, readExport };
