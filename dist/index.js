@@ -81795,9 +81795,12 @@ const DEFAULT_IMAGE = 'tsantalis/refactoringminer:latest';
 const CONTAINER_EXPORT = '/diff/exported';
 const RM_JAR = '/opt/refactoringminer/lib/RefactoringMiner-DockerBuild.jar';
 
-// Companion-extension feed, published next to the web view. The browser
-// extension fetches this and renders the overlays itself, reusing this single
-// RefactoringMiner run instead of recomputing anything client-side.
+// Companion-extension feed: a copy of RefactoringMiner's `jsons/refactorings.json`
+// placed inside the web view so it publishes alongside it (Pages + artifact).
+// The browser extension fetches this and renders the overlays itself, reusing
+// this single RefactoringMiner run instead of recomputing anything client-side.
+// The copy is made inside the container (as root) because the export dirs are
+// root-owned on the host — the non-root action process can't write into them.
 const FEED_FILE = 'refactorings.json';
 
 /**
@@ -81848,7 +81851,8 @@ async function exportDiff(eventName, eventPath, image = DEFAULT_IMAGE, token = '
     `refactoringminer diff --url "${url}" -e && ` +
       `unzip -o ${RM_JAR} -d /tmp/rm > /dev/null && ` +
       `mkdir -p ${CONTAINER_EXPORT}/web && ` +
-      `cp -r /tmp/rm/web ${CONTAINER_EXPORT}/web/resources`,
+      `cp -r /tmp/rm/web ${CONTAINER_EXPORT}/web/resources && ` +
+      `{ cp ${CONTAINER_EXPORT}/jsons/${FEED_FILE} ${CONTAINER_EXPORT}/web/${FEED_FILE} || true; }`,
   ]);
 
   const webDir = path.join(tmpDir, 'web');
@@ -81856,21 +81860,19 @@ async function exportDiff(eventName, eventPath, image = DEFAULT_IMAGE, token = '
     throw new Error(`Expected exported web view at ${webDir} was not produced`);
   }
 
-  const exported = readExport(tmpDir);
-  writeFeed(webDir, url, exported);
-
-  return { webDir, refactorings: exported.refactorings };
+  return { webDir, refactorings: readRefactorings(tmpDir) };
 }
 
 /**
  * Reads the `jsons/refactorings.json` that `diff --export` writes next to the
- * web view. Each refactoring carries `markup` (GitHub-linked, used by the PR
- * comment) plus `leftSideLocations`/`rightSideLocations` (the `CodeRange`s the
- * extension overlays). Throws if the file is absent, which signals the image
- * predates the JSON/markup export and must be updated.
+ * web view, and returns its `refactorings` array. Each entry carries `markup`
+ * (GitHub-linked, used by the PR comment) plus `leftSideLocations`/
+ * `rightSideLocations` — the `CodeRange`s the extension overlays from the
+ * published copy of this same file. Throws if it's absent, which signals the
+ * image predates the JSON/markup export and must be updated.
  */
-function readExport(tmpDir) {
-  const jsonPath = path.join(tmpDir, 'jsons', 'refactorings.json');
+function readRefactorings(tmpDir) {
+  const jsonPath = path.join(tmpDir, 'jsons', FEED_FILE);
   if (!fs.existsSync(jsonPath)) {
     throw new Error(
       `RefactoringMiner did not produce ${jsonPath}. The image must include the ` +
@@ -81879,25 +81881,10 @@ function readExport(tmpDir) {
   }
 
   const parsed = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-  return {
-    url: typeof parsed.url === 'string' ? parsed.url : '',
-    refactorings: Array.isArray(parsed.refactorings) ? parsed.refactorings : [],
-  };
+  return Array.isArray(parsed.refactorings) ? parsed.refactorings : [];
 }
 
-/**
- * Writes the companion-extension feed into the web view so publisher's
- * `cpSync(webDir, …)` carries it to `refactorings/pr-<n>/refactorings.json`
- * (Pages) or into the artifact. Shape mirrors RefactoringMiner's classic
- * `-json` output — `{ commits: [ { url, refactorings:[…] } ] }` — which is what
- * the extension's overlay engine already expects.
- */
-function writeFeed(webDir, analysisUrl, exported) {
-  const feed = { commits: [{ url: exported.url || analysisUrl, refactorings: exported.refactorings }] };
-  fs.writeFileSync(path.join(webDir, FEED_FILE), JSON.stringify(feed));
-}
-
-module.exports = { exportDiff, buildAnalysisUrl, readExport };
+module.exports = { exportDiff, buildAnalysisUrl, readRefactorings };
 
 
 /***/ }),
