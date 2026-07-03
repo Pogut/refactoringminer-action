@@ -1,23 +1,17 @@
 const core = require('@actions/core');
-const exec = require('@actions/exec');
 const { DefaultArtifactClient } = require('@actions/artifact');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
-const PAGES_BRANCH = 'gh-pages';
-const PAGES_ROOT = 'refactorings';
 const ARTIFACT_NAME = 'refactoring-diff';
-const GIT_USER = 'github-actions[bot]';
-const GIT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com';
 
 /**
  * Decides where to publish the exported web view.
  *
- *   private repo                          -> 'artifact'
- *   Pages unconfigured (404)              -> 'pages'  (we create + enable gh-pages)
- *   Pages already served from gh-pages    -> 'pages'  (ours / compatible, we use a subpath)
- *   Pages served from anything else       -> 'artifact'  (their own site; don't clobber it)
+ *   private repo                              -> 'artifact'
+ *   Pages unconfigured (404)                   -> 'pages'  (we enable it in Actions-deploy mode)
+ *   Pages already deployed via Actions workflow -> 'pages'  (ours / compatible)
+ *   Pages served any other way (branch build)   -> 'artifact'  (don't reconfigure someone else's site)
  */
 async function decideTarget(octokit, owner, repo, isPrivate) {
   if (isPrivate) {
@@ -26,8 +20,17 @@ async function decideTarget(octokit, owner, repo, isPrivate) {
 
   try {
     const { data } = await octokit.rest.repos.getPages({ owner, repo });
-    const fromGhPages = data.build_type !== 'workflow' && data.source && data.source.branch === PAGES_BRANCH;
-    return fromGhPages ? 'pages' : 'artifact';
+    if (data.build_type === 'workflow') {
+      return 'pages';
+    }
+    if (data.source?.branch === 'gh-pages') {
+      core.warning(
+        'GitHub Pages is currently deployed from the gh-pages branch (legacy build). ' +
+        'To get fast Actions-based deploys, switch Settings → Pages → Build and deployment → ' +
+        'Source to "GitHub Actions" once; falling back to a workflow artifact for now.',
+      );
+    }
+    return 'artifact';
   } catch (err) {
     if (err.status === 404) {
       return 'pages';
@@ -37,126 +40,21 @@ async function decideTarget(octokit, owner, repo, isPrivate) {
   }
 }
 
-function authRemote(serverUrl, owner, repo, token) {
-  const host = new URL(serverUrl).host;
-  return `https://x-access-token:${token}@${host}/${owner}/${repo}.git`;
-}
-
-function pagesUrl(owner, repo, prNumber) {
-  return `https://${owner.toLowerCase()}.github.io/${repo}/${PAGES_ROOT}/pr-${prNumber}/list/`;
-}
-
-async function git(args, cwd) {
-  return exec.exec('git', args, { cwd, ignoreReturnCode: true });
-}
-
 /**
- * Clones (or creates) the gh-pages branch into a fresh temp checkout and
- * returns its path. Falls back to an orphan branch when gh-pages doesn't exist.
+ * Enables GitHub Pages in "deploy from GitHub Actions" mode if it isn't already.
+ * A 409 means Pages already exists — since `decideTarget` only routes here when
+ * Pages is unconfigured or already in workflow mode, a 409 always means the
+ * latter, so it's safe to treat as success.
  */
-async function checkoutPagesBranch(remote) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rm-pages-'));
-  const cloned = await exec.exec(
-    'git',
-    ['clone', '--depth', '1', '--branch', PAGES_BRANCH, '--single-branch', remote, dir],
-    { ignoreReturnCode: true },
-  );
-
-  if (cloned !== 0) {
-    await git(['init'], dir);
-    await git(['remote', 'add', 'origin', remote], dir);
-    await git(['checkout', '--orphan', PAGES_BRANCH], dir);
-  }
-
-  await git(['config', 'user.name', GIT_USER], dir);
-  await git(['config', 'user.email', GIT_EMAIL], dir);
-  return dir;
-}
-
-async function commitAndPush(dir, message) {
-  await git(['add', '-A'], dir);
-  const committed = await git(['commit', '-m', message], dir);
-  if (committed !== 0) {
-    return; // nothing to commit
-  }
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if ((await git(['push', 'origin', PAGES_BRANCH], dir)) === 0) {
-      return;
-    }
-    // Likely a concurrent push from another PR/commit — rebase and retry.
-    await git(['pull', '--rebase', 'origin', PAGES_BRANCH], dir);
-  }
-  throw new Error('Failed to push to gh-pages after retries');
-}
-
-/**
- * Publishes the exported web view to the gh-pages branch under
- * refactorings/pr-<n>/ and enables Pages if needed. Returns the view URL.
- */
-async function publishToPages({ octokit, token, serverUrl, owner, repo, webDir, prNumber }) {
-  const remote = authRemote(serverUrl, owner, repo, token);
-  const dir = await checkoutPagesBranch(remote);
-
-  const dest = path.join(dir, PAGES_ROOT, `pr-${prNumber}`);
-  fs.mkdirSync(dest, { recursive: true });
-  fs.cpSync(webDir, dest, { recursive: true });
-
-  // Disable Jekyll so Pages serves the Monaco assets verbatim (Jekyll otherwise
-  // drops files/folders beginning with an underscore).
-  fs.writeFileSync(path.join(dir, '.nojekyll'), '');
-
-  await commitAndPush(dir, `Publish refactoring diff for PR #${prNumber}`);
-  fs.rmSync(dir, { recursive: true, force: true });
-
-  await ensurePagesEnabled(octokit, owner, repo);
-  return pagesUrl(owner, repo, prNumber);
-}
-
 async function ensurePagesEnabled(octokit, owner, repo) {
   try {
-    await octokit.rest.repos.createPagesSite({
-      owner,
-      repo,
-      source: { branch: PAGES_BRANCH, path: '/' },
-    });
+    await octokit.rest.repos.createPagesSite({ owner, repo, build_type: 'workflow' });
   } catch (err) {
-    // 409 = already enabled, which is the common case after the first run.
     if (err.status === 409) {
       return;
     }
-    // The GITHUB_TOKEN cannot enable Pages via the API, so this needs a one-time
-    // manual step. The diff is already on gh-pages; once Pages is on, links work.
-    core.warning(
-      'The interactive diff was pushed to the gh-pages branch, but GitHub Pages is not ' +
-      'enabled yet (the GITHUB_TOKEN cannot enable it automatically). Enable it once under ' +
-      'Settings → Pages → "Deploy from a branch" → branch "gh-pages", folder "/ (root)". ' +
-      'After that, the comment link works on every run.',
-    );
+    throw new Error(`GitHub Pages could not be enabled automatically (${err.message})`);
   }
-}
-
-/** Removes a closed PR's published diffs from gh-pages. Best-effort. */
-async function cleanupPages({ token, serverUrl, owner, repo, prNumber }) {
-  const remote = authRemote(serverUrl, owner, repo, token);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rm-pages-'));
-  const cloned = await exec.exec(
-    'git',
-    ['clone', '--depth', '1', '--branch', PAGES_BRANCH, '--single-branch', remote, dir],
-    { ignoreReturnCode: true },
-  );
-  if (cloned !== 0) {
-    return; // no gh-pages branch, nothing to clean
-  }
-
-  const target = path.join(dir, PAGES_ROOT, `pr-${prNumber}`);
-  if (fs.existsSync(target)) {
-    fs.rmSync(target, { recursive: true, force: true });
-    await git(['config', 'user.name', GIT_USER], dir);
-    await git(['config', 'user.email', GIT_EMAIL], dir);
-    await commitAndPush(dir, `Remove refactoring diff for closed PR #${prNumber}`);
-  }
-  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 function listFiles(dir) {
@@ -175,9 +73,7 @@ async function uploadArtifactView({ webDir, serverUrl, owner, repo, runId }) {
 
 module.exports = {
   decideTarget,
-  publishToPages,
+  ensurePagesEnabled,
   uploadArtifactView,
-  cleanupPages,
-  pagesUrl,
   ARTIFACT_NAME,
 };

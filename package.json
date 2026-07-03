@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "GitHub Action that detects refactorings and posts a PR comment",
-  "main": "src/index.js",
+  "main": "src/export.js",
   "scripts": {
-    "build": "ncc build src/index.js -o dist --source-map --license licenses.txt",
+    "build": "ncc build src/export.js -o dist/export --source-map --license licenses.txt && ncc build src/comment.js -o dist/comment --source-map --license licenses.txt",
     "test": "jest",
     "lint": "eslint src/ tests/",
     "lint:fix": "eslint src/ tests/ --fix"

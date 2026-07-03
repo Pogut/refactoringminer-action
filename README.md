@@ -17,8 +17,8 @@ on:
     types: [opened, synchronize, reopened, closed]
 
 permissions:
-  contents: write        # publish the interactive view to gh-pages
-  pages: write           # enable GitHub Pages on first run
+  pages: write           # enable + deploy GitHub Pages
+  id-token: write        # required to deploy Pages via GitHub Actions
   pull-requests: write   # post the PR comment
 
 jobs:
@@ -45,7 +45,7 @@ That's it. On every pull request, the action analyzes the commit range and posts
 > - **Extract Method** — `validateInput()` extracted from `submit()` in `FormHandler.java`
 > - **Rename Variable** — `x` renamed to `itemCount` in `Inventory.java`
 >
-> 🔍 **[View the interactive diff](#)** _(first run may take ~1 min to go live)_
+> 🔍 **[View the interactive diff](#)**
 
 When no refactorings are found, the comment reads _"No refactorings detected in this change."_ The action reuses the same comment across pushes to a PR rather than posting a new one each time.
 
@@ -69,6 +69,21 @@ When no refactorings are found, the comment reads _"No refactorings detected in 
 1. On `pull_request` events, runs `refactoringminer -bc` across the commit range from base to head and posts a grouped summary as a PR comment.
 2. On `push` events, runs `refactoringminer -c` against the pushed commit and logs the result to the workflow output.
 3. The Docker image is pulled and run automatically — you don't need Java, Docker setup, or RefactoringMiner installed on the runner.
+
+### Interactive diff hosting
+
+On public repos, the exported view is deployed to **GitHub Pages via GitHub's
+Actions-based deployment** (the same mechanism `actions/deploy-pages` uses) —
+it publishes in seconds rather than going through the legacy branch-build
+queue. Each run replaces the previously deployed diff. If Pages can't be used
+(private repo, or Pages is already configured to deploy some other way), the
+view is uploaded as a workflow artifact instead and linked from the run page.
+
+> **Upgrading from an older version of this action?** If Pages was previously
+> set up to deploy from a `gh-pages` branch, switch **Settings → Pages →
+> Build and deployment → Source** to **"GitHub Actions"** once (or delete the
+> `gh-pages` branch) so this action can redeploy in the fast mode above —
+> otherwise it falls back to the artifact link and warns in the run log.
 
 ## Requirements
 

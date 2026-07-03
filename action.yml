@@ -16,11 +16,46 @@ inputs:
     required: false
     default: 'tsantalis/refactoringminer:latest'
   enable-web-view:
-    description: 'Export the interactive AST-diff view and link it in the PR comment (GitHub Pages on public repos, workflow artifact otherwise)'
+    description: 'Export the interactive AST-diff view and link it in the PR comment (GitHub Pages, deployed via GitHub Actions, on public repos; workflow artifact otherwise)'
     required: false
     default: 'true'
 
 runs:
-  using: 'node24'
-  main: 'dist/index.js'
-  
+  using: 'composite'
+  steps:
+    - name: Export diff
+      id: export
+      shell: bash
+      run: node "${{ github.action_path }}/dist/export/index.js"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        RM_IMAGE: ${{ inputs.image }}
+        ENABLE_WEB_VIEW: ${{ inputs.enable-web-view }}
+
+    # Deploying via GitHub's own Pages-deployment API (through these two official
+    # actions) is what makes this fast: it swaps a CDN artifact instead of queuing
+    # through the legacy branch-build pipeline that `git push`-to-gh-pages used.
+    - name: Upload Pages artifact
+      id: pages-artifact
+      if: steps.export.outputs.mode == 'pages'
+      continue-on-error: true
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ${{ steps.export.outputs.web-dir }}
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      if: steps.export.outputs.mode == 'pages' && steps.pages-artifact.outcome == 'success'
+      continue-on-error: true
+      uses: actions/deploy-pages@v4
+
+    - name: Post PR comment
+      if: steps.export.outputs.mode != 'skip' && steps.export.outputs.mode != 'log'
+      shell: bash
+      run: node "${{ github.action_path }}/dist/comment/index.js"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ steps.export.outputs.mode }}
+        REFACTORINGS_PATH: ${{ steps.export.outputs.refactorings-path }}
+        VIEW_URL: ${{ steps.export.outputs.mode == 'pages' && steps.deployment.outputs.page_url || steps.export.outputs.view-url }}
+        DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}

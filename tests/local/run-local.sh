@@ -3,8 +3,12 @@
 # Run the RefactoringMiner action locally against a local Docker image.
 #
 # It reproduces the GitHub Actions runtime (env vars + event payload + a `docker`
-# that doesn't try to pull) and invokes the compiled action at dist/index.js,
-# so the real exporter.js / formatter.js code paths execute.
+# that doesn't try to pull) and invokes the compiled export/comment steps at
+# dist/export/index.js and dist/comment/index.js, so the real exporter.js /
+# formatter.js code paths execute. It does NOT exercise the actual GitHub
+# Pages deploy (actions/upload-pages-artifact + actions/deploy-pages) since
+# those require the real Actions runtime's OIDC token — mode=pages just stops
+# after export.js and reports what would have been deployed.
 #
 # Usage:
 #   ./run-local.sh                # push/commit-analysis path (default)
@@ -81,15 +85,19 @@ echo "  event file : $EVENT_PATH"
 echo "========================================================================"
 
 # ---------------------------------------------------------------------------
-# Invoke the action. `env` is used so we can set the hyphenated INPUT_* vars
-# that @actions/core expects (github-token -> INPUT_GITHUB-TOKEN, etc.), and
-# the shim dir is prepended to PATH so `docker pull` is a no-op.
+# Phase 1: export.js. `core.setOutput` appends `name=value` lines to
+# $GITHUB_OUTPUT, same as the real runtime, so we point it at a scratch file
+# and parse it back out below instead of hand-parsing the deprecated
+# `::set-output::` stdout format.
 # ---------------------------------------------------------------------------
-exec env \
+OUTPUT_FILE="$(mktemp)"
+trap 'rm -f "$OUTPUT_FILE"' EXIT
+
+env \
   PATH="$HERE/shim:$PATH" \
-  "INPUT_GITHUB-TOKEN=$GITHUB_TOKEN" \
-  "INPUT_IMAGE=$IMAGE" \
-  "INPUT_ENABLE-WEB-VIEW=$ENABLE_WEB_VIEW" \
+  GITHUB_TOKEN="$GITHUB_TOKEN" \
+  RM_IMAGE="$IMAGE" \
+  ENABLE_WEB_VIEW="$ENABLE_WEB_VIEW" \
   GITHUB_EVENT_NAME="$EVENT" \
   GITHUB_EVENT_PATH="$EVENT_PATH" \
   GITHUB_WORKSPACE="$WORKSPACE" \
@@ -97,4 +105,34 @@ exec env \
   GITHUB_SHA="$SHA" \
   GITHUB_SERVER_URL="https://github.com" \
   GITHUB_RUN_ID="000000" \
-  node "$ACTION_ROOT/dist/index.js"
+  GITHUB_OUTPUT="$OUTPUT_FILE" \
+  node "$ACTION_ROOT/dist/export/index.js"
+
+MODE="$(sed -n 's/^mode=//p' "$OUTPUT_FILE")"
+WEB_DIR="$(sed -n 's/^web-dir=//p' "$OUTPUT_FILE")"
+VIEW_URL="$(sed -n 's/^view-url=//p' "$OUTPUT_FILE")"
+REFACTORINGS_PATH="$(sed -n 's/^refactorings-path=//p' "$OUTPUT_FILE")"
+
+echo "--- export.js result ---"
+echo "  mode              : $MODE"
+[ -n "$WEB_DIR" ] && echo "  web-dir           : $WEB_DIR (would be deployed via actions/deploy-pages in real CI)"
+[ -n "$VIEW_URL" ] && echo "  view-url          : $VIEW_URL"
+echo "------------------------"
+
+if [ "$MODE" = "skip" ] || [ "$MODE" = "log" ]; then
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 2: comment.js. Real CI only reaches this after the Pages-deploy steps;
+# locally we just pass through whatever export.js already resolved.
+# ---------------------------------------------------------------------------
+exec env \
+  GITHUB_TOKEN="$GITHUB_TOKEN" \
+  GITHUB_EVENT_PATH="$EVENT_PATH" \
+  GITHUB_REPOSITORY="$REPOSITORY" \
+  MODE="$MODE" \
+  REFACTORINGS_PATH="$REFACTORINGS_PATH" \
+  VIEW_URL="$VIEW_URL" \
+  DEPLOY_OUTCOME="success" \
+  node "$ACTION_ROOT/dist/comment/index.js"
