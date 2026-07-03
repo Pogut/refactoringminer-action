@@ -81927,9 +81927,16 @@ const ARTIFACT_NAME = 'refactoring-diff';
  * Decides where to publish the exported web view.
  *
  *   private repo                              -> 'artifact'
- *   Pages unconfigured (404)                   -> 'pages'  (we enable it in Actions-deploy mode)
- *   Pages already deployed via Actions workflow -> 'pages'  (ours / compatible)
+ *   Pages unconfigured (404)                   -> 'pages-unconfigured'  (needs createPagesSite first)
+ *   Pages already deployed via Actions workflow -> 'pages'  (ready to deploy straight away)
  *   Pages served any other way (branch build)   -> 'artifact'  (don't reconfigure someone else's site)
+ *
+ * The unconfigured/ready distinction matters because the default GITHUB_TOKEN
+ * cannot call createPagesSite at all (GitHub restricts that endpoint to a PAT
+ * or GitHub App with admin rights) — it 403s even when the site already
+ * exists, rather than 409ing. So that call must only be attempted when Pages
+ * genuinely isn't set up yet; an already-enabled site must skip straight to
+ * 'pages' or every run would fail there before ever reaching the deploy step.
  */
 async function decideTarget(octokit, owner, repo, isPrivate) {
   if (isPrivate) {
@@ -81951,27 +81958,22 @@ async function decideTarget(octokit, owner, repo, isPrivate) {
     return 'artifact';
   } catch (err) {
     if (err.status === 404) {
-      return 'pages';
+      return 'pages-unconfigured';
     }
     core.warning(`Could not query GitHub Pages (${err.message}); falling back to artifact.`);
     return 'artifact';
   }
 }
 
-/**
- * Enables GitHub Pages in "deploy from GitHub Actions" mode if it isn't already.
- * A 409 means Pages already exists — since `decideTarget` only routes here when
- * Pages is unconfigured or already in workflow mode, a 409 always means the
- * latter, so it's safe to treat as success.
- */
+/** Enables GitHub Pages in "deploy from GitHub Actions" mode. Only call this for 'pages-unconfigured'. */
 async function ensurePagesEnabled(octokit, owner, repo) {
   try {
     await octokit.rest.repos.createPagesSite({ owner, repo, build_type: 'workflow' });
   } catch (err) {
-    if (err.status === 409) {
-      return;
-    }
-    throw new Error(`GitHub Pages could not be enabled automatically (${err.message})`);
+    throw new Error(
+      `GitHub Pages could not be enabled automatically (${err.message}). The default GITHUB_TOKEN ` +
+      'cannot create a Pages site — enable it once under Settings → Pages → Source → "GitHub Actions".',
+    );
   }
 }
 
@@ -133310,9 +133312,11 @@ async function run() {
     const octokit = getOctokit(token);
     const target = await decideTarget(octokit, owner, repo, event.repository.private);
 
-    if (target === 'pages') {
+    if (target === 'pages' || target === 'pages-unconfigured') {
       try {
-        await ensurePagesEnabled(octokit, owner, repo);
+        if (target === 'pages-unconfigured') {
+          await ensurePagesEnabled(octokit, owner, repo);
+        }
         core.setOutput('mode', 'pages');
         core.setOutput('web-dir', webDir);
       } catch (error) {

@@ -25,9 +25,9 @@ describe('decideTarget', () => {
     expect(octokit.rest.repos.getPages).not.toHaveBeenCalled();
   });
 
-  test('unconfigured Pages (404) selects the pages path', async () => {
+  test('unconfigured Pages (404) selects the pages path and flags it as needing enabling', async () => {
     const octokit = octokitWithPages(jest.fn().mockRejectedValue({ status: 404 }));
-    expect(await decideTarget(octokit, 'o', 'r', false)).toBe('pages');
+    expect(await decideTarget(octokit, 'o', 'r', false)).toBe('pages-unconfigured');
   });
 
   test('Pages already deployed via GitHub Actions selects the pages path', async () => {
@@ -68,12 +68,7 @@ describe('ensurePagesEnabled', () => {
     expect(createPagesSite).toHaveBeenCalledWith({ owner: 'o', repo: 'r', build_type: 'workflow' });
   });
 
-  test('treats a 409 (already enabled) as success', async () => {
-    const octokit = { rest: { repos: { createPagesSite: jest.fn().mockRejectedValue({ status: 409 }) } } };
-    await expect(ensurePagesEnabled(octokit, 'o', 'r')).resolves.toBeUndefined();
-  });
-
-  test('throws on unexpected errors', async () => {
+  test('throws when the token cannot create the Pages site (e.g. 403)', async () => {
     const octokit = { rest: { repos: { createPagesSite: jest.fn().mockRejectedValue({ status: 403, message: 'nope' }) } } };
     await expect(ensurePagesEnabled(octokit, 'o', 'r')).rejects.toThrow('nope');
   });

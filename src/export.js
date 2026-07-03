@@ -60,9 +60,11 @@ async function run() {
     const octokit = getOctokit(token);
     const target = await decideTarget(octokit, owner, repo, event.repository.private);
 
-    if (target === 'pages') {
+    if (target === 'pages' || target === 'pages-unconfigured') {
       try {
-        await ensurePagesEnabled(octokit, owner, repo);
+        if (target === 'pages-unconfigured') {
+          await ensurePagesEnabled(octokit, owner, repo);
+        }
         core.setOutput('mode', 'pages');
         core.setOutput('web-dir', webDir);
       } catch (error) {
