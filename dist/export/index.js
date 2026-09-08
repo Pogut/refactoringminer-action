@@ -81736,52 +81736,6 @@ ZipStream.prototype.finalize = function() {
 
 /***/ }),
 
-/***/ 51147:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
-
-const { getOctokit } = __nccwpck_require__(93228);
-const fs = __nccwpck_require__(79896);
-const { COMMENT_HEADER } = __nccwpck_require__(59315);
-
-async function postOrUpdateComment(token, body, eventPath, octokit = getOctokit(token)) {
-  const event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
-  const prNumber = event.pull_request.number;
-  const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-
-  const { data: comments } = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number: prNumber,
-    per_page: 100,
-  });
-
-  const existing = comments.find(c => c.body.startsWith(COMMENT_HEADER));
-
-  // Delete the previous report and post a fresh one, so the comment always
-  // lands at the bottom of the conversation (the newest event) rather than
-  // staying pinned to wherever it was first posted. Updating in place would
-  // keep its original timeline position and force scrolling up to find it.
-  if (existing) {
-    await octokit.rest.issues.deleteComment({
-      owner,
-      repo,
-      comment_id: existing.id,
-    });
-  }
-
-  await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body,
-  });
-}
-
-module.exports = { postOrUpdateComment, COMMENT_HEADER };
-
-
-/***/ }),
-
 /***/ 53396:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -81794,6 +81748,14 @@ const path = __nccwpck_require__(16928);
 const DEFAULT_IMAGE = 'tsantalis/refactoringminer:latest';
 const CONTAINER_EXPORT = '/diff/exported';
 const RM_JAR = '/opt/refactoringminer/lib/RefactoringMiner-DockerBuild.jar';
+
+// Companion-extension feed: a copy of RefactoringMiner's `jsons/refactorings.json`
+// placed inside the web view so it publishes alongside it (Pages + artifact).
+// The browser extension fetches this and renders the overlays itself, reusing
+// this single RefactoringMiner run instead of recomputing anything client-side.
+// The copy is made inside the container (as root) because the export dirs are
+// root-owned on the host — the non-root action process can't write into them.
+const FEED_FILE = 'refactorings.json';
 
 /**
  * Builds the GitHub URL that RefactoringMiner's `diff --url` mode analyzes.
@@ -81843,7 +81805,8 @@ async function exportDiff(eventName, eventPath, image = DEFAULT_IMAGE, token = '
     `refactoringminer diff --url "${url}" -e && ` +
       `unzip -o ${RM_JAR} -d /tmp/rm > /dev/null && ` +
       `mkdir -p ${CONTAINER_EXPORT}/web && ` +
-      `cp -r /tmp/rm/web ${CONTAINER_EXPORT}/web/resources`,
+      `cp -r /tmp/rm/web ${CONTAINER_EXPORT}/web/resources && ` +
+      `{ cp ${CONTAINER_EXPORT}/jsons/${FEED_FILE} ${CONTAINER_EXPORT}/web/${FEED_FILE} || true; }`,
   ]);
 
   const webDir = path.join(tmpDir, 'web');
@@ -81856,11 +81819,14 @@ async function exportDiff(eventName, eventPath, image = DEFAULT_IMAGE, token = '
 
 /**
  * Reads the `jsons/refactorings.json` that `diff --export` writes next to the
- * web view, and returns its `refactorings` array. Throws if the file is absent,
- * which signals the image predates the JSON/markup export and must be updated.
+ * web view, and returns its `refactorings` array. Each entry carries `markup`
+ * (GitHub-linked, used by the PR comment) plus `leftSideLocations`/
+ * `rightSideLocations` — the `CodeRange`s the extension overlays from the
+ * published copy of this same file. Throws if it's absent, which signals the
+ * image predates the JSON/markup export and must be updated.
  */
 function readRefactorings(tmpDir) {
-  const jsonPath = path.join(tmpDir, 'jsons', 'refactorings.json');
+  const jsonPath = path.join(tmpDir, 'jsons', FEED_FILE);
   if (!fs.existsSync(jsonPath)) {
     throw new Error(
       `RefactoringMiner did not produce ${jsonPath}. The image must include the ` +
@@ -81892,7 +81858,7 @@ function viewFooter(view) {
     return '';
   }
   if (view.kind === 'pages') {
-    return `\n\n🔍 **[View the interactive diff](${view.url})** _(first run may take ~1 min to go live)_`;
+    return `\n\n🔍 **[View the interactive diff](${view.url})**`;
   }
   return `\n\n📦 Interactive diff exported as a workflow artifact — [open the run](${view.url}), download \`refactoring-diff\`, and open \`web/list/index.html\`.`;
 }
@@ -82026,25 +81992,26 @@ module.exports = { buildComment, COMMENT_HEADER };
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const core = __nccwpck_require__(37484);
-const exec = __nccwpck_require__(95236);
 const { DefaultArtifactClient } = __nccwpck_require__(76846);
 const fs = __nccwpck_require__(79896);
-const os = __nccwpck_require__(70857);
 const path = __nccwpck_require__(16928);
 
-const PAGES_BRANCH = 'gh-pages';
-const PAGES_ROOT = 'refactorings';
 const ARTIFACT_NAME = 'refactoring-diff';
-const GIT_USER = 'github-actions[bot]';
-const GIT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com';
 
 /**
  * Decides where to publish the exported web view.
  *
- *   private repo                          -> 'artifact'
- *   Pages unconfigured (404)              -> 'pages'  (we create + enable gh-pages)
- *   Pages already served from gh-pages    -> 'pages'  (ours / compatible, we use a subpath)
- *   Pages served from anything else       -> 'artifact'  (their own site; don't clobber it)
+ *   private repo                                -> 'artifact'
+ *   Pages unconfigured (404)                    -> 'pages-unconfigured'  (needs createPagesSite first)
+ *   Pages already deployed via Actions workflow -> 'pages'  (ready to deploy straight away)
+ *   Pages served any other way (branch build)   -> 'artifact'  (don't reconfigure someone else's site)
+ *
+ * The unconfigured/ready distinction matters because the default GITHUB_TOKEN
+ * cannot call createPagesSite at all (GitHub restricts that endpoint to a PAT
+ * or GitHub App with admin rights) — it 403s even when the site already
+ * exists, rather than 409ing. So that call must only be attempted when Pages
+ * genuinely isn't set up yet; an already-enabled site must skip straight to
+ * 'pages' or every run would fail there before ever reaching the deploy step.
  */
 async function decideTarget(octokit, owner, repo, isPrivate) {
   if (isPrivate) {
@@ -82053,137 +82020,36 @@ async function decideTarget(octokit, owner, repo, isPrivate) {
 
   try {
     const { data } = await octokit.rest.repos.getPages({ owner, repo });
-    const fromGhPages = data.build_type !== 'workflow' && data.source && data.source.branch === PAGES_BRANCH;
-    return fromGhPages ? 'pages' : 'artifact';
+    if (data.build_type === 'workflow') {
+      return 'pages';
+    }
+    if (data.source?.branch === 'gh-pages') {
+      core.warning(
+        'GitHub Pages is currently deployed from the gh-pages branch (legacy build). ' +
+        'To get fast Actions-based deploys, switch Settings → Pages → Build and deployment → ' +
+        'Source to "GitHub Actions" once; falling back to a workflow artifact for now.',
+      );
+    }
+    return 'artifact';
   } catch (err) {
     if (err.status === 404) {
-      return 'pages';
+      return 'pages-unconfigured';
     }
     core.warning(`Could not query GitHub Pages (${err.message}); falling back to artifact.`);
     return 'artifact';
   }
 }
 
-function authRemote(serverUrl, owner, repo, token) {
-  const host = new URL(serverUrl).host;
-  return `https://x-access-token:${token}@${host}/${owner}/${repo}.git`;
-}
-
-function pagesUrl(owner, repo, prNumber) {
-  return `https://${owner.toLowerCase()}.github.io/${repo}/${PAGES_ROOT}/pr-${prNumber}/list/`;
-}
-
-async function git(args, cwd) {
-  return exec.exec('git', args, { cwd, ignoreReturnCode: true });
-}
-
-/**
- * Clones (or creates) the gh-pages branch into a fresh temp checkout and
- * returns its path. Falls back to an orphan branch when gh-pages doesn't exist.
- */
-async function checkoutPagesBranch(remote) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rm-pages-'));
-  const cloned = await exec.exec(
-    'git',
-    ['clone', '--depth', '1', '--branch', PAGES_BRANCH, '--single-branch', remote, dir],
-    { ignoreReturnCode: true },
-  );
-
-  if (cloned !== 0) {
-    await git(['init'], dir);
-    await git(['remote', 'add', 'origin', remote], dir);
-    await git(['checkout', '--orphan', PAGES_BRANCH], dir);
-  }
-
-  await git(['config', 'user.name', GIT_USER], dir);
-  await git(['config', 'user.email', GIT_EMAIL], dir);
-  return dir;
-}
-
-async function commitAndPush(dir, message) {
-  await git(['add', '-A'], dir);
-  const committed = await git(['commit', '-m', message], dir);
-  if (committed !== 0) {
-    return; // nothing to commit
-  }
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if ((await git(['push', 'origin', PAGES_BRANCH], dir)) === 0) {
-      return;
-    }
-    // Likely a concurrent push from another PR/commit — rebase and retry.
-    await git(['pull', '--rebase', 'origin', PAGES_BRANCH], dir);
-  }
-  throw new Error('Failed to push to gh-pages after retries');
-}
-
-/**
- * Publishes the exported web view to the gh-pages branch under
- * refactorings/pr-<n>/ and enables Pages if needed. Returns the view URL.
- */
-async function publishToPages({ octokit, token, serverUrl, owner, repo, webDir, prNumber }) {
-  const remote = authRemote(serverUrl, owner, repo, token);
-  const dir = await checkoutPagesBranch(remote);
-
-  const dest = path.join(dir, PAGES_ROOT, `pr-${prNumber}`);
-  fs.mkdirSync(dest, { recursive: true });
-  fs.cpSync(webDir, dest, { recursive: true });
-
-  // Disable Jekyll so Pages serves the Monaco assets verbatim (Jekyll otherwise
-  // drops files/folders beginning with an underscore).
-  fs.writeFileSync(path.join(dir, '.nojekyll'), '');
-
-  await commitAndPush(dir, `Publish refactoring diff for PR #${prNumber}`);
-  fs.rmSync(dir, { recursive: true, force: true });
-
-  await ensurePagesEnabled(octokit, owner, repo);
-  return pagesUrl(owner, repo, prNumber);
-}
-
+/** Enables GitHub Pages in "deploy from GitHub Actions" mode. Only call this for 'pages-unconfigured'. */
 async function ensurePagesEnabled(octokit, owner, repo) {
   try {
-    await octokit.rest.repos.createPagesSite({
-      owner,
-      repo,
-      source: { branch: PAGES_BRANCH, path: '/' },
-    });
+    await octokit.rest.repos.createPagesSite({ owner, repo, build_type: 'workflow' });
   } catch (err) {
-    // 409 = already enabled, which is the common case after the first run.
-    if (err.status === 409) {
-      return;
-    }
-    // The GITHUB_TOKEN cannot enable Pages via the API, so this needs a one-time
-    // manual step. The diff is already on gh-pages; once Pages is on, links work.
-    core.warning(
-      'The interactive diff was pushed to the gh-pages branch, but GitHub Pages is not ' +
-      'enabled yet (the GITHUB_TOKEN cannot enable it automatically). Enable it once under ' +
-      'Settings → Pages → "Deploy from a branch" → branch "gh-pages", folder "/ (root)". ' +
-      'After that, the comment link works on every run.',
+    throw new Error(
+      `GitHub Pages could not be enabled automatically (${err.message}). The default GITHUB_TOKEN ` +
+      'cannot create a Pages site — enable it once under Settings → Pages → Source → "GitHub Actions".',
     );
   }
-}
-
-/** Removes a closed PR's published diffs from gh-pages. Best-effort. */
-async function cleanupPages({ token, serverUrl, owner, repo, prNumber }) {
-  const remote = authRemote(serverUrl, owner, repo, token);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rm-pages-'));
-  const cloned = await exec.exec(
-    'git',
-    ['clone', '--depth', '1', '--branch', PAGES_BRANCH, '--single-branch', remote, dir],
-    { ignoreReturnCode: true },
-  );
-  if (cloned !== 0) {
-    return; // no gh-pages branch, nothing to clean
-  }
-
-  const target = path.join(dir, PAGES_ROOT, `pr-${prNumber}`);
-  if (fs.existsSync(target)) {
-    fs.rmSync(target, { recursive: true, force: true });
-    await git(['config', 'user.name', GIT_USER], dir);
-    await git(['config', 'user.email', GIT_EMAIL], dir);
-    await commitAndPush(dir, `Remove refactoring diff for closed PR #${prNumber}`);
-  }
-  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 function listFiles(dir) {
@@ -82202,10 +82068,8 @@ async function uploadArtifactView({ webDir, serverUrl, owner, repo, runId }) {
 
 module.exports = {
   decideTarget,
-  publishToPages,
+  ensurePagesEnabled,
   uploadArtifactView,
-  cleanupPages,
-  pagesUrl,
   ARTIFACT_NAME,
 };
 
@@ -97285,6 +97149,24 @@ exports.StorageContextClient = StorageContextClient;
 
 /***/ }),
 
+/***/ 83627:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.KnownEncryptionAlgorithmType = void 0;
+/** Known values of {@link EncryptionAlgorithmType} that the service accepts. */
+var KnownEncryptionAlgorithmType;
+(function (KnownEncryptionAlgorithmType) {
+    KnownEncryptionAlgorithmType["AES256"] = "AES256";
+})(KnownEncryptionAlgorithmType || (exports.KnownEncryptionAlgorithmType = KnownEncryptionAlgorithmType = {}));
+//# sourceMappingURL=generatedModels.js.map
+
+/***/ }),
+
 /***/ 30247:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -107611,6 +107493,132 @@ exports.listType = {
 
 /***/ }),
 
+/***/ 56635:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=appendBlob.js.map
+
+/***/ }),
+
+/***/ 68355:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=blob.js.map
+
+/***/ }),
+
+/***/ 17188:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=blockBlob.js.map
+
+/***/ }),
+
+/***/ 15337:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=container.js.map
+
+/***/ }),
+
+/***/ 82354:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const tslib_1 = __nccwpck_require__(61860);
+tslib_1.__exportStar(__nccwpck_require__(26865), exports);
+tslib_1.__exportStar(__nccwpck_require__(15337), exports);
+tslib_1.__exportStar(__nccwpck_require__(68355), exports);
+tslib_1.__exportStar(__nccwpck_require__(14400), exports);
+tslib_1.__exportStar(__nccwpck_require__(56635), exports);
+tslib_1.__exportStar(__nccwpck_require__(17188), exports);
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 14400:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=pageBlob.js.map
+
+/***/ }),
+
+/***/ 26865:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ *
+ * Code generated by Microsoft (R) AutoRest Code Generator.
+ * Changes may cause incorrect behavior and will be lost if the code is regenerated.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+//# sourceMappingURL=service.js.map
+
+/***/ }),
+
 /***/ 40535:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -110826,132 +110834,6 @@ const filterBlobsOperationSpec = {
 
 /***/ }),
 
-/***/ 56635:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=appendBlob.js.map
-
-/***/ }),
-
-/***/ 68355:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=blob.js.map
-
-/***/ }),
-
-/***/ 17188:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=blockBlob.js.map
-
-/***/ }),
-
-/***/ 15337:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=container.js.map
-
-/***/ }),
-
-/***/ 82354:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-const tslib_1 = __nccwpck_require__(61860);
-tslib_1.__exportStar(__nccwpck_require__(26865), exports);
-tslib_1.__exportStar(__nccwpck_require__(15337), exports);
-tslib_1.__exportStar(__nccwpck_require__(68355), exports);
-tslib_1.__exportStar(__nccwpck_require__(14400), exports);
-tslib_1.__exportStar(__nccwpck_require__(56635), exports);
-tslib_1.__exportStar(__nccwpck_require__(17188), exports);
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 14400:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=pageBlob.js.map
-
-/***/ }),
-
-/***/ 26865:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-/*
- * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
- *
- * Code generated by Microsoft (R) AutoRest Code Generator.
- * Changes may cause incorrect behavior and will be lost if the code is regenerated.
- */
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-//# sourceMappingURL=service.js.map
-
-/***/ }),
-
 /***/ 5313:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -111022,24 +110904,6 @@ class StorageClient extends coreHttpCompat.ExtendedServiceClient {
 }
 exports.StorageClient = StorageClient;
 //# sourceMappingURL=storageClient.js.map
-
-/***/ }),
-
-/***/ 83627:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.KnownEncryptionAlgorithmType = void 0;
-/** Known values of {@link EncryptionAlgorithmType} that the service accepts. */
-var KnownEncryptionAlgorithmType;
-(function (KnownEncryptionAlgorithmType) {
-    KnownEncryptionAlgorithmType["AES256"] = "AES256";
-})(KnownEncryptionAlgorithmType || (exports.KnownEncryptionAlgorithmType = KnownEncryptionAlgorithmType = {}));
-//# sourceMappingURL=generatedModels.js.map
 
 /***/ }),
 
@@ -133464,16 +133328,38 @@ var __webpack_exports__ = {};
 const core = __nccwpck_require__(37484);
 const { getOctokit } = __nccwpck_require__(93228);
 const fs = __nccwpck_require__(79896);
+const os = __nccwpck_require__(70857);
+const path = __nccwpck_require__(16928);
 const { exportDiff } = __nccwpck_require__(53396);
 const { buildComment } = __nccwpck_require__(59315);
-const { postOrUpdateComment } = __nccwpck_require__(51147);
-const { decideTarget, publishToPages, uploadArtifactView, cleanupPages } = __nccwpck_require__(94965);
+const { decideTarget, ensurePagesEnabled, uploadArtifactView } = __nccwpck_require__(94965);
 
+/**
+ * First half of the action, run as a plain node step of the composite action.
+ * Produces the interactive web view and refactorings JSON, decides where the
+ * view should be published, and (for the Pages path) hands the exported
+ * directory off via outputs so the action's bundle → upload → deploy steps can
+ * do the actual publish. That is what makes publishing fast: GitHub's
+ * Actions-based Pages deployment swaps a CDN artifact, instead of the old
+ * push-to-gh-pages-branch build queue.
+ *
+ * Sets `mode` to one of:
+ *   skip     — nothing to do (a closed PR with the web view disabled)
+ *   remove   — the PR closed: the bundle step deletes its folder and redeploys
+ *   log      — not a pull request; the report was written to the log here
+ *   pages    — deploy via the composite steps (web-dir is set)
+ *   artifact — already uploaded as a workflow artifact here (view-url is set)
+ *   no-view  — post the comment without a view link
+ *
+ * Inputs arrive as plain env vars, wired from `inputs.*` by action.yml, rather
+ * than through core.getInput: a composite action's steps don't receive the
+ * INPUT_* variables a node action does.
+ */
 async function run() {
   try {
-    const token = core.getInput('github-token', { required: true });
-    const image = core.getInput('image');
-    const enableWebView = (core.getInput('enable-web-view') || 'true') !== 'false';
+    const token = process.env.GITHUB_TOKEN;
+    const image = process.env.RM_IMAGE || 'tsantalis/refactoringminer:latest';
+    const enableWebView = (process.env.ENABLE_WEB_VIEW || 'true') !== 'false';
 
     const eventName = process.env.GITHUB_EVENT_NAME;
     const eventPath = process.env.GITHUB_EVENT_PATH;
@@ -133482,11 +133368,12 @@ async function run() {
     const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
 
     const event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
-    const octokit = getOctokit(token);
 
-    // A closed PR: remove its published diffs and stop.
+    // A closed PR: no analysis. With the web view on, the bundle step removes
+    // the PR's folder from the published site so it isn't left behind forever.
     if (eventName === 'pull_request' && event.action === 'closed') {
-      await cleanupPages({ token, serverUrl, owner, repo, prNumber: event.pull_request.number });
+      core.setOutput('pr-number', event.pull_request.number);
+      core.setOutput('mode', enableWebView ? 'remove' : 'skip');
       return;
     }
 
@@ -133495,44 +133382,53 @@ async function run() {
     // exact GitHub diff lines. No separate commit-analysis run.
     const { webDir, refactorings } = await exportDiff(eventName, eventPath, image, token);
 
-    let view;
-    if (enableWebView && eventName === 'pull_request') {
-      view = await publishView({ octokit, token, serverUrl, owner, repo, runId, webDir, event });
+    if (eventName !== 'pull_request') {
+      core.info(buildComment(refactorings));
+      core.setOutput('mode', 'log');
+      return;
     }
 
-    const body = buildComment(refactorings, view);
+    core.setOutput('pr-number', event.pull_request.number);
 
-    if (eventName === 'pull_request') {
-      await postOrUpdateComment(token, body, eventPath, octokit);
-    } else {
-      core.info(body);
+    // The comment step runs after the deploy, in its own process: hand it the
+    // JSON through a file rather than an output, which has a size limit.
+    const feedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rm-feed-'));
+    const refactoringsPath = path.join(feedDir, 'refactorings.json');
+    fs.writeFileSync(refactoringsPath, JSON.stringify(refactorings));
+    core.setOutput('refactorings-path', refactoringsPath);
+
+    if (!enableWebView) {
+      core.setOutput('mode', 'no-view');
+      return;
+    }
+
+    const octokit = getOctokit(token);
+    const target = await decideTarget(octokit, owner, repo, event.repository.private);
+
+    if (target === 'pages' || target === 'pages-unconfigured') {
+      try {
+        if (target === 'pages-unconfigured') {
+          await ensurePagesEnabled(octokit, owner, repo);
+        }
+        core.setOutput('mode', 'pages');
+        core.setOutput('web-dir', webDir);
+      } catch (error) {
+        core.warning(`Interactive diff view unavailable: ${error.message}`);
+        core.setOutput('mode', 'no-view');
+      }
+      return;
+    }
+
+    try {
+      const url = await uploadArtifactView({ webDir, serverUrl, owner, repo, runId });
+      core.setOutput('mode', 'artifact');
+      core.setOutput('view-url', url);
+    } catch (error) {
+      core.warning(`Interactive diff view unavailable: ${error.message}`);
+      core.setOutput('mode', 'no-view');
     }
   } catch (error) {
     core.setFailed(error.message);
-  }
-}
-
-/**
- * Publishes the already-exported web view (Pages or artifact) and returns a
- * `{ url, kind }` view descriptor. Any failure here is non-fatal: it logs a
- * warning and returns undefined so the summary comment is still posted.
- */
-async function publishView({ octokit, token, serverUrl, owner, repo, runId, webDir, event }) {
-  try {
-    const prNumber = event.pull_request.number;
-    const isPrivate = event.repository.private;
-
-    const target = await decideTarget(octokit, owner, repo, isPrivate);
-    if (target === 'pages') {
-      const url = await publishToPages({ octokit, token, serverUrl, owner, repo, webDir, prNumber });
-      return { url, kind: 'pages' };
-    }
-
-    const url = await uploadArtifactView({ webDir, serverUrl, owner, repo, runId });
-    return { url, kind: 'artifact' };
-  } catch (error) {
-    core.warning(`Interactive diff view unavailable: ${error.message}`);
-    return undefined;
   }
 }
 
