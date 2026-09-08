@@ -16,10 +16,94 @@ inputs:
     required: false
     default: 'tsantalis/refactoringminer:latest'
   enable-web-view:
-    description: 'Export the interactive AST-diff view and link it in the PR comment (GitHub Pages when the repo is public and Pages is served from gh-pages, workflow artifact otherwise)'
+    description: 'Export and publish the interactive AST-diff view (GitHub Pages, deployed via GitHub Actions, on public repos; workflow artifact otherwise)'
     required: false
     default: 'true'
+  store-retention-days:
+    description: 'How long the bundled multi-PR site is kept between runs, in days. A repository idle for longer than this starts a fresh site.'
+    required: false
+    default: '90'
 
 runs:
-  using: 'node24'
-  main: 'dist/index.js'
+  using: 'composite'
+  steps:
+    # Runs RefactoringMiner once, writes the refactorings JSON for the comment
+    # step, and decides how the view gets published: `pages` (deploy below),
+    # `artifact` (already uploaded here), `no-view`, `remove` (the PR closed),
+    # `log` (not a PR) or `skip`.
+    - name: Export diff
+      id: export
+      shell: bash
+      run: node "${{ github.action_path }}/dist/export/index.js"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        RM_IMAGE: ${{ inputs.image }}
+        ENABLE_WEB_VIEW: ${{ inputs.enable-web-view }}
+
+    # Multi-PR bundling. GitHub's Actions-based Pages deploy replaces the WHOLE
+    # site on every run, so to keep every open PR's view alive the site is
+    # rebuilt as "previous runs + this PR" each time. The accumulated site is
+    # carried between runs as a single tar inside a long-retention `pages-store`
+    # artifact (the `github-pages` artifact itself is pruned after about a day):
+    # this run restores the newest one, adds this PR's export under its own
+    # refactorings/pr-<n>/ folder (or removes it, when the PR closed), and hands
+    # the re-bundled tar to the deploy and persist steps below. The deploy stays
+    # the fast CDN swap — nothing goes through the legacy branch-build queue.
+    #   The consuming workflow MUST grant `actions: read` (to fetch the prior
+    #   artifact) and set a `concurrency:` group so simultaneous PRs don't
+    #   overwrite each other's folder — artifacts can't merge atomically.
+    - name: Bundle this PR into the multi-PR site
+      id: bundle
+      if: steps.export.outputs.mode == 'pages' || steps.export.outputs.mode == 'remove'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ steps.export.outputs.mode }}
+        WEB_DIR: ${{ steps.export.outputs.web-dir }}
+      run: bash "${{ github.action_path }}/scripts/bundle-site.sh"
+
+    # The same tar `actions/upload-pages-artifact` would build, uploaded under
+    # the name `actions/deploy-pages` looks for. Built once above, uploaded twice:
+    # here for the deploy, and below as the store the next run starts from.
+    - name: Upload Pages artifact
+      id: pages-artifact
+      if: steps.bundle.outputs.deploy == 'true'
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: github-pages
+        path: ${{ steps.bundle.outputs.deploy-tar }}
+        retention-days: 1
+        if-no-files-found: error
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      if: steps.bundle.outputs.deploy == 'true' && steps.pages-artifact.outcome == 'success'
+      continue-on-error: true
+      uses: actions/deploy-pages@v4
+
+    # Persist the just-deployed bundle so the next run can restore and extend
+    # it. Only saved when the deploy actually succeeded, so the store never
+    # drifts ahead of what is live.
+    - name: Persist multi-PR store
+      if: steps.bundle.outputs.deploy == 'true' && steps.deployment.outcome == 'success'
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: pages-store
+        path: ${{ steps.bundle.outputs.store-tar }}
+        retention-days: ${{ inputs.store-retention-days }}
+        if-no-files-found: error
+
+    - name: Post PR comment
+      if: steps.export.outputs.mode != 'skip' && steps.export.outputs.mode != 'log' && steps.export.outputs.mode != 'remove'
+      shell: bash
+      run: node "${{ github.action_path }}/dist/comment/index.js"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ steps.export.outputs.mode }}
+        REFACTORINGS_PATH: ${{ steps.export.outputs.refactorings-path }}
+        # Each PR's view lives under refactorings/pr-<n>/list/ in the bundled site.
+        VIEW_URL: ${{ steps.export.outputs.mode == 'pages' && format('{0}refactorings/pr-{1}/list/', steps.deployment.outputs.page_url, steps.bundle.outputs.pr-number) || steps.export.outputs.view-url }}
+        DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}

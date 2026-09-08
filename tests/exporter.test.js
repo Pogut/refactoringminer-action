@@ -96,6 +96,13 @@ describe('exportDiff', () => {
     expect(refactorings[0].markup).toContain('in class `C`');
   });
 
+  test('copies the refactorings feed into the web view inside the container', async () => {
+    await exportDiff('pull_request', '/event.json', 'img', 'tok');
+    const [, args] = exec.exec.mock.calls[0];
+    const script = args[args.length - 1];
+    expect(script).toContain('cp /diff/exported/jsons/refactorings.json /diff/exported/web/refactorings.json');
+  });
+
   test('throws when the export did not produce a web view', async () => {
     fs.existsSync.mockReturnValue(false);
     await expect(exportDiff('pull_request', '/event.json', 'img', 'tok'))
