@@ -15,23 +15,22 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
 
-permissions:
-  contents: read         # read the pull request's diff
-  pull-requests: write   # post the summary comment
-  pages: write           # deploy the interactive diff to GitHub Pages
-  id-token: write        # required by the Pages deployment
-  actions: read          # restore the previously published PRs (see below)
+ permissions:
+     contents: read         # was contents: write
+     pull-requests: write
+     pages: write
+     id-token: write        # new
+     actions: read          # new
 
-# Serialize publishes so two PRs' runs can't overwrite each other's view.
-concurrency:
-  group: refactoring-pages-publish
-  cancel-in-progress: false
+   concurrency:
+     group: refactoring-pages-publish
+     cancel-in-progress: false
 
-jobs:
-  report:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: Pogut/RefactoringMiner-action@v1
+   jobs:
+     report:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: Pogut/RefactoringMiner-action@v2
 ```
 
 That is the entire workflow — note there is **no `actions/checkout` step**. RefactoringMiner is handed the pull request's URL and the job's token and reads the diff from GitHub directly, so nothing is read from the runner's filesystem. Adding a checkout (especially `fetch-depth: 0`) only costs you clone time.
