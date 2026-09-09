@@ -119,7 +119,7 @@ If you are getting the artifact link and expected the published view, check the 
 ### Pinning the RefactoringMiner version
 
 ```yaml
-      - uses: Pogut/RefactoringMiner-action@v1
+      - uses: Pogut/RefactoringMiner-action@v2
         with:
           image: tsantalis/refactoringminer:3.0.9
 ```
